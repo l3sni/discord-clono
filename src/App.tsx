@@ -130,25 +130,31 @@ function App() {
   // eslint-disable-next-line no-unused-expressions
   keyVersion; // read so React tracks the dependency
 
-  // ─── Encryption setup ─────────────────────────────────────────────────
+  // ─── Encryption setup: load key pair ────────────────────────────────────
+
+  const [publicKeyJwk, setPublicKeyJwk] = useState<string | null>(null);
 
   useEffect(() => {
     if (!connected || !identity) return;
     (async () => {
-      const { publicKeyJwk, privateKey } = await getOrCreateKeyPair();
-      privateKeyRef.current = privateKey;
-
-      const user = users.find(u => u.identity.toHexString() === identity.toHexString());
-      if (user && !user.publicKey) {
-        setPublicKeyReducer({ publicKey: publicKeyJwk });
-      }
+      const kp = await getOrCreateKeyPair();
+      privateKeyRef.current = kp.privateKey;
+      setPublicKeyJwk(kp.publicKeyJwk);
     })();
   }, [connected, identity]);
+
+  // Upload public key once we have it AND the user row exists
+  useEffect(() => {
+    if (!publicKeyJwk || !currentUser) return;
+    if (!currentUser.publicKey) {
+      setPublicKeyReducer({ publicKey: publicKeyJwk });
+    }
+  }, [publicKeyJwk, currentUser]);
 
   // ─── Decrypt channel keys from encrypted_channel_key table ────────────
 
   useEffect(() => {
-    if (!identity || !privateKeyRef.current) return;
+    if (!identity || !privateKeyRef.current || !publicKeyJwk) return;
 
     (async () => {
       let added = false;
@@ -170,10 +176,10 @@ function App() {
         }
       }
       if (added) {
-        setKeyVersion(v => v + 1); // trigger re-render so decryption runs
+        setKeyVersion(v => v + 1);
       }
     })();
-  }, [encryptedKeys, identity]);
+  }, [encryptedKeys, identity, publicKeyJwk]);
 
   // ─── Decrypt messages ─────────────────────────────────────────────────
 
