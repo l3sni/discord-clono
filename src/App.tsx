@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import './App.css';
 import { tables, reducers } from './module_bindings';
 import { useSpacetimeDB, useTable, useReducer } from 'spacetimedb/react';
@@ -15,15 +15,9 @@ import {
   SetNameModal,
 } from './components/Modals';
 import {
-  getOrCreateKeyPair,
-  generateChannelKey,
-  exportChannelKey,
-  encryptChannelKeyForMember,
-  decryptChannelKey,
+  deriveChannelKey,
   encryptMessage,
   decryptMessage,
-  cacheChannelKey,
-  getCachedChannelKey,
 } from './hooks/useEncryption';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -47,14 +41,12 @@ function App() {
 
   // Reducers
   const setNameReducer = useReducer(reducers.setName);
-  const setPublicKeyReducer = useReducer(reducers.setPublicKey);
   const createServerReducer = useReducer(reducers.createServer);
   const joinServerReducer = useReducer(reducers.joinServer);
   const leaveServerReducer = useReducer(reducers.leaveServer);
   const createChannelReducer = useReducer(reducers.createChannel);
   const createThreadReducer = useReducer(reducers.createThread);
   const sendMessageReducer = useReducer(reducers.sendMessage);
-  const storeChannelKeyReducer = useReducer(reducers.storeChannelKey);
 
   // Tables
   const [users] = useTable(tables.user);
@@ -63,7 +55,6 @@ function App() {
   const [channels] = useTable(tables.channel);
   const [threads] = useTable(tables.thread);
   const [rawMessages] = useTable(tables.message);
-  const [encryptedKeys] = useTable(tables.encryptedChannelKey);
 
   // UI state
   const [selectedServerId, setSelectedServerId] = useState<bigint | null>(null);
@@ -74,26 +65,32 @@ function App() {
   const [showCreateChannel, setShowCreateChannel] = useState(false);
   const [showSetName, setShowSetName] = useState(false);
 
-  // Encryption state — use a version counter to trigger re-renders when keys change
-  const privateKeyRef = useRef<CryptoKey | null>(null);
-  const channelKeysRef = useRef<Map<string, CryptoKey>>(new Map());
-  const [keyVersion, setKeyVersion] = useState(0); // bumped when any channel key is added
+  // Encryption — channel key derived from invite code + channel ID
+  const channelKeyRef = useRef<CryptoKey | null>(null);
+  const channelKeyIdRef = useRef<string>('');
   const [decryptedMessages, setDecryptedMessages] = useState<DecryptedMessage[]>([]);
-  // Track which channels we've already initiated key generation for (prevents race)
-  const keyGenInFlightRef = useRef<Set<string>>(new Set());
+  const [hasChannelKey, setHasChannelKey] = useState(false);
 
   // ─── Derived data ─────────────────────────────────────────────────────
 
-  const currentUser = users.find(u => identity && u.identity.toHexString() === identity.toHexString());
-  const userName = currentUser?.name || identity?.toHexString().substring(0, 8) || 'Unknown';
+  const currentUser = users.find(
+    u => identity && u.identity.toHexString() === identity.toHexString()
+  );
+  const userName =
+    currentUser?.name || identity?.toHexString().substring(0, 8) || 'Unknown';
 
   const myServers = servers.filter(s =>
     serverMembers.some(
-      m => m.serverId === s.id && identity && m.memberId.toHexString() === identity.toHexString()
+      m =>
+        m.serverId === s.id &&
+        identity &&
+        m.memberId.toHexString() === identity.toHexString()
     )
   );
 
-  const selectedServer = selectedServerId ? servers.find(s => s.id === selectedServerId) : null;
+  const selectedServer = selectedServerId
+    ? servers.find(s => s.id === selectedServerId)
+    : null;
 
   const serverChannels = selectedServerId
     ? channels.filter(c => c.serverId === selectedServerId)
@@ -114,7 +111,9 @@ function App() {
   const serverMemberUsers = selectedServerId
     ? users.filter(u =>
         serverMembers.some(
-          m => m.serverId === selectedServerId && m.memberId.toHexString() === u.identity.toHexString()
+          m =>
+            m.serverId === selectedServerId &&
+            m.memberId.toHexString() === u.identity.toHexString()
         )
       )
     : [];
@@ -124,62 +123,30 @@ function App() {
       ? selectedServer.ownerId.toHexString() === identity.toHexString()
       : false;
 
-  const hasChannelKey = selectedChannelId
-    ? channelKeysRef.current.has(selectedChannelId.toString())
-    : false;
-  // eslint-disable-next-line no-unused-expressions
-  keyVersion; // read so React tracks the dependency
-
-  // ─── Encryption setup: load key pair ────────────────────────────────────
-
-  const [publicKeyJwk, setPublicKeyJwk] = useState<string | null>(null);
+  // ─── Derive channel encryption key ────────────────────────────────────
+  // Key = SHA-256(inviteCode + channelId). All members derive the same key.
 
   useEffect(() => {
-    if (!connected || !identity) return;
-    (async () => {
-      const kp = await getOrCreateKeyPair();
-      privateKeyRef.current = kp.privateKey;
-      setPublicKeyJwk(kp.publicKeyJwk);
-    })();
-  }, [connected, identity]);
-
-  // Upload public key once we have it AND the user row exists
-  useEffect(() => {
-    if (!publicKeyJwk || !currentUser) return;
-    if (!currentUser.publicKey) {
-      setPublicKeyReducer({ publicKey: publicKeyJwk });
+    if (!selectedChannel || !selectedServer) {
+      channelKeyRef.current = null;
+      channelKeyIdRef.current = '';
+      setHasChannelKey(false);
+      return;
     }
-  }, [publicKeyJwk, currentUser]);
 
-  // ─── Decrypt channel keys from encrypted_channel_key table ────────────
-
-  useEffect(() => {
-    if (!identity || !privateKeyRef.current || !publicKeyJwk) return;
+    const keyId = `${selectedServer.inviteCode}:${selectedChannel.id}`;
+    if (channelKeyIdRef.current === keyId) return; // already derived
 
     (async () => {
-      let added = false;
-      for (const eck of encryptedKeys) {
-        if (eck.memberId.toHexString() !== identity.toHexString()) continue;
-        const chId = eck.channelId.toString();
-        if (channelKeysRef.current.has(chId)) continue;
-
-        try {
-          let key = await getCachedChannelKey(chId);
-          if (!key) {
-            key = await decryptChannelKey(eck.encryptedKey, privateKeyRef.current!);
-            await cacheChannelKey(chId, key);
-          }
-          channelKeysRef.current.set(chId, key);
-          added = true;
-        } catch (e) {
-          console.warn('Failed to decrypt channel key for channel', chId, e);
-        }
-      }
-      if (added) {
-        setKeyVersion(v => v + 1);
-      }
+      const key = await deriveChannelKey(
+        selectedServer.inviteCode,
+        selectedChannel.id
+      );
+      channelKeyRef.current = key;
+      channelKeyIdRef.current = keyId;
+      setHasChannelKey(true);
     })();
-  }, [encryptedKeys, identity, publicKeyJwk]);
+  }, [selectedChannel, selectedServer]);
 
   // ─── Decrypt messages ─────────────────────────────────────────────────
 
@@ -189,8 +156,10 @@ function App() {
       return;
     }
 
-    const channelMessages = rawMessages.filter(m => m.channelId === selectedChannelId);
-    const channelKey = channelKeysRef.current.get(selectedChannelId.toString());
+    const channelMessages = rawMessages.filter(
+      m => m.channelId === selectedChannelId
+    );
+    const channelKey = channelKeyRef.current;
 
     (async () => {
       const decrypted: DecryptedMessage[] = [];
@@ -210,7 +179,6 @@ function App() {
             content = await decryptMessage(msg.content, msg.iv, channelKey);
             encrypted = false;
           } catch {
-            // Decryption failed — different key or corrupt
             content = '';
           }
         }
@@ -220,7 +188,8 @@ function App() {
           channelId: msg.channelId,
           threadId: msg.threadId,
           senderId: msg.senderId,
-          senderName: sender?.name || msg.senderId.toHexString().substring(0, 8),
+          senderName:
+            sender?.name || msg.senderId.toHexString().substring(0, 8),
           senderColor: sender?.avatarColor || '#5865F2',
           content,
           sentAt: msg.sentAt.toDate(),
@@ -231,115 +200,7 @@ function App() {
       decrypted.sort((a, b) => a.sentAt.getTime() - b.sentAt.getTime());
       setDecryptedMessages(decrypted);
     })();
-  }, [rawMessages, selectedChannelId, users, keyVersion]);
-
-  // ─── Key generation: only the server OWNER generates keys ─────────────
-  //     This eliminates the race where two clients both generate different keys.
-
-  const setupChannelEncryption = useCallback(
-    async (channelId: bigint) => {
-      const chId = channelId.toString();
-      if (channelKeysRef.current.has(chId)) return;
-      if (keyGenInFlightRef.current.has(chId)) return;
-      keyGenInFlightRef.current.add(chId);
-
-      try {
-        const channelKey = await generateChannelKey();
-        channelKeysRef.current.set(chId, channelKey);
-        await cacheChannelKey(chId, channelKey);
-        setKeyVersion(v => v + 1);
-
-        const ch = channels.find(c => c.id === channelId);
-        if (!ch) return;
-
-        const members = serverMembers.filter(m => m.serverId === ch.serverId);
-        const raw = await exportChannelKey(channelKey);
-
-        for (const member of members) {
-          const memberUser = users.find(
-            u => u.identity.toHexString() === member.memberId.toHexString()
-          );
-          if (!memberUser?.publicKey) continue;
-
-          try {
-            const encrypted = await encryptChannelKeyForMember(raw, memberUser.publicKey);
-            storeChannelKeyReducer({
-              channelId,
-              memberIdentityHex: member.memberId.toHexString(),
-              encryptedKey: encrypted,
-            });
-          } catch (e) {
-            console.warn('Failed to encrypt channel key for member', e);
-          }
-        }
-      } finally {
-        keyGenInFlightRef.current.delete(chId);
-      }
-    },
-    [channels, serverMembers, users, storeChannelKeyReducer]
-  );
-
-  // Server owner: generate keys for channels that have no encrypted keys yet
-  useEffect(() => {
-    if (!identity || !connected) return;
-
-    for (const ch of channels) {
-      const srv = servers.find(s => s.id === ch.serverId);
-      if (!srv) continue;
-      // Only server owner generates keys — single source of truth
-      if (srv.ownerId.toHexString() !== identity.toHexString()) continue;
-
-      const chId = ch.id.toString();
-      if (channelKeysRef.current.has(chId)) continue;
-
-      const existingKeys = encryptedKeys.filter(ek => ek.channelId === ch.id);
-      if (existingKeys.length > 0) continue; // keys already exist
-
-      setupChannelEncryption(ch.id);
-    }
-  }, [channels, servers, encryptedKeys, identity, connected, setupChannelEncryption]);
-
-  // ─── Auto-distribute keys to new members (anyone who has the key can distribute) ──
-
-  useEffect(() => {
-    if (!identity || !connected) return;
-
-    (async () => {
-      for (const [chIdStr, channelKey] of channelKeysRef.current.entries()) {
-        const ch = channels.find(c => c.id.toString() === chIdStr);
-        if (!ch) continue;
-
-        const members = serverMembers.filter(m => m.serverId === ch.serverId);
-        const existingKeys = encryptedKeys.filter(
-          ek => ek.channelId.toString() === chIdStr
-        );
-
-        for (const member of members) {
-          const hasKey = existingKeys.some(
-            ek => ek.memberId.toHexString() === member.memberId.toHexString()
-          );
-          if (hasKey) continue;
-
-          const memberUser = users.find(
-            u => u.identity.toHexString() === member.memberId.toHexString()
-          );
-          if (!memberUser?.publicKey) continue;
-
-          try {
-            const raw = await exportChannelKey(channelKey);
-            const encrypted = await encryptChannelKeyForMember(raw, memberUser.publicKey);
-            storeChannelKeyReducer({
-              channelId: ch.id,
-              memberIdentityHex: member.memberId.toHexString(),
-              encryptedKey: encrypted,
-            });
-          } catch (e) {
-            console.warn('Failed to distribute key to member', e);
-          }
-        }
-      }
-    })();
-  }, [serverMembers, users, encryptedKeys, channels, connected, identity, keyVersion]);
+  }, [rawMessages, selectedChannelId, users, hasChannelKey]);
 
   // ─── Auto-select first channel ────────────────────────────────────────
 
@@ -359,14 +220,11 @@ function App() {
 
   // ─── Handlers ─────────────────────────────────────────────────────────
 
-  const handleSelectServer = useCallback(
-    (id: bigint | null) => {
-      setSelectedServerId(id);
-      setSelectedChannelId(null);
-      setSelectedThreadId(null);
-    },
-    []
-  );
+  const handleSelectServer = useCallback((id: bigint | null) => {
+    setSelectedServerId(id);
+    setSelectedChannelId(null);
+    setSelectedThreadId(null);
+  }, []);
 
   const handleSelectChannel = useCallback((id: bigint) => {
     setSelectedChannelId(id);
@@ -401,7 +259,6 @@ function App() {
       if (!selectedServerId) return;
       setShowCreateChannel(false);
       await createChannelReducer({ serverId: selectedServerId, name, topic });
-      // Key generation happens automatically via the owner effect above
     },
     [selectedServerId, createChannelReducer]
   );
@@ -410,7 +267,7 @@ function App() {
     async (text: string) => {
       if (!selectedChannelId) return;
 
-      const channelKey = channelKeysRef.current.get(selectedChannelId.toString());
+      const channelKey = channelKeyRef.current;
       let content: string;
       let iv: string;
 
@@ -437,7 +294,7 @@ function App() {
     async (text: string) => {
       if (!selectedChannelId || !selectedThreadId) return;
 
-      const channelKey = channelKeysRef.current.get(selectedChannelId.toString());
+      const channelKey = channelKeyRef.current;
       let content: string;
       let iv: string;
 
@@ -527,7 +384,11 @@ function App() {
       ) : (
         <div className="message-area empty-state">
           <div className="empty-state-content">
-            <h2>{selectedServer ? 'Select a channel' : 'Welcome to Discord Clone'}</h2>
+            <h2>
+              {selectedServer
+                ? 'Select a channel'
+                : 'Welcome to Discord Clone'}
+            </h2>
             <p>
               {selectedServer
                 ? 'Choose a channel from the sidebar to start chatting'
