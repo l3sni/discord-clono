@@ -1,0 +1,6 @@
+node_modules
+dist
+spacetimedb/dist
+spacetimedb/node_modules
+spacetimedb/package-lock.json
+*.local
